@@ -17,6 +17,18 @@ export const LIFT_PLAN_QUERY = gql`
   }
 `;
 
+export const LIFT_PLAN_VERSIONS_QUERY = gql`
+  query LiftPlanVersions($planId: ID!) {
+    liftPlanVersions(planId: $planId) {
+      id
+      revision
+      batchId
+      status
+      lockedAt
+    }
+  }
+`;
+
 export const graphqlClient = new ApolloClient({
   cache: new InMemoryCache(),
   link: ApolloLink.empty()
@@ -35,4 +47,10 @@ graphqlClient.writeQuery({
       steps: []
     }
   }
+});
+
+graphqlClient.writeQuery({
+  query: LIFT_PLAN_VERSIONS_QUERY,
+  variables: { planId: 'LP-2026-0918' },
+  data: { liftPlanVersions: [] }
 });

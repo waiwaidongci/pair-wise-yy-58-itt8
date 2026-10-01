@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import * as THREE from 'three';
-import { useLiftStore } from './store';
+import { ROLE_SCOPES, fingerprintFor, useLiftStore, type VersionSnapshot } from './store';
 
 const route = useRoute();
 const router = useRouter();
@@ -17,6 +17,11 @@ let theta = 0.8;
 let phi = 0.9;
 let dragging = false;
 let previousX = 0;
+
+const signingRole = ref<string | null>(null);
+const opinionText = ref('');
+const versionDialog = ref(false);
+const viewingVersion = ref<VersionSnapshot | null>(null);
 
 const nav = [
   { path: '/', label: '三维复核', icon: 'view_in_ar' },
@@ -38,6 +43,48 @@ function severityLabel(severity: string) {
 function submitComment() {
   store.addComment(commentText.value);
   commentText.value = '';
+}
+
+function sigOf(role: string) {
+  return store.signatures.find((item) => item.role === role);
+}
+
+function fpOf(role: string) {
+  return fingerprintFor(role, store.steps, store.comments);
+}
+
+function startSign(role: string) {
+  signingRole.value = role;
+  opinionText.value = sigOf(role)?.opinion ?? '';
+}
+
+async function confirmSign(role: string) {
+  await store.signRole(role, opinionText.value);
+  signingRole.value = null;
+  opinionText.value = '';
+}
+
+async function runConcurrent() {
+  const target = store.signatures.find((item) => item.status !== 'signed')?.role ?? ROLE_SCOPES[0].role;
+  await store.simulateConcurrentSign(target);
+}
+
+function badgeColor(status: string) {
+  return status === 'signed' ? 'positive' : status === 'stale' ? 'warning' : 'grey';
+}
+
+function badgeLabel(status: string) {
+  return status === 'signed' ? '已签署' : status === 'stale' ? '已失效' : '待签署';
+}
+
+function formatTime(iso: string | null) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
+}
+
+function openVersion(version: VersionSnapshot) {
+  viewingVersion.value = version;
+  versionDialog.value = true;
 }
 
 function initializeScene() {
@@ -158,6 +205,7 @@ function initializeScene() {
 
 onMounted(() => {
   nextTick(initializeScene);
+  store.recoverAll();
 });
 
 onBeforeUnmount(() => {
@@ -219,7 +267,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="heading-actions">
             <q-btn outline no-caps icon="ios_share" label="导出吊装指令" />
-            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0 || !store.allSigned" @click="store.lockPlan" />
           </div>
         </header>
 
@@ -343,27 +391,128 @@ onBeforeUnmount(() => {
             </div>
             <div class="readiness"><strong>{{ store.readiness }}%</strong><span>发布就绪度</span></div>
           </div>
+
+          <div class="batch-bar">
+            <div class="batch-meta">
+              <span class="batch-id">授权批次 {{ store.batch?.batchId ?? '—' }}</span>
+              <span>发起于 {{ formatTime(store.batch?.initiatedAt ?? null) }}</span>
+              <q-badge :color="store.batch?.status === 'committed' ? 'teal' : 'orange'">
+                {{ store.batch?.status === 'committed' ? '批次已提交' : '会签进行中' }}
+              </q-badge>
+              <q-badge color="blue-grey">{{ store.signedCount }}/4 已签署</q-badge>
+            </div>
+            <div class="batch-actions">
+              <q-btn outline no-caps size="sm" icon="refresh" label="重新发起复核" @click="store.initiateReview()" />
+              <q-btn outline no-caps size="sm" icon="health_and_safety" label="按批次号恢复" @click="store.recoverByBatch(store.batch?.batchId ?? '')" />
+              <q-btn outline no-caps size="sm" icon="group" label="模拟两终端同时签署" @click="runConcurrent" />
+              <q-toggle v-model="store.simulateWriteFailure" label="模拟写入故障" dense />
+            </div>
+          </div>
+
+          <q-banner v-if="store.lastNotice" class="notice-banner" :class="`tone-${store.lastNotice.tone}`" rounded dense>
+            {{ store.lastNotice.message }}
+          </q-banner>
+          <q-banner v-if="store.recoveryReport" class="notice-banner tone-info" rounded dense>
+            批次恢复报告：批次 {{ store.recoveryReport.batchId }} · {{ store.recoveryReport.role }} 角色 · {{ store.recoveryReport.action === 'completed' ? '整份补全' : '已回滚' }} · {{ formatTime(store.recoveryReport.at) }}
+          </q-banner>
+
           <div class="review-grid">
-            <article v-for="person in [
-              { name: '陈晓', team: '总包项目部', scope: '吊装工序与场地移交', state: '已接受' },
-              { name: '刘明', team: '设备管理', scope: '吊车参数与支腿地基', state: '待确认' },
-              { name: '周工', team: '安全监督', scope: '净空、风速与警戒区', state: '有保留' },
-              { name: '赵磊', team: '方案工程', scope: '载荷计算与路径参数', state: '待确认' }
-            ]" :key="person.name" class="review-card">
-              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === '已接受' ? 'positive' : person.state === '有保留' ? 'warning' : 'grey'">{{ person.state }}</q-badge></div>
-              <span>{{ person.team }}</span>
-              <p>{{ person.scope }}</p>
-              <q-btn v-if="person.state !== '已接受'" outline no-caps label="接受方案" />
-              <q-btn v-else disable no-caps label="已签署" />
+            <article v-for="scope in ROLE_SCOPES" :key="scope.id" class="review-card" :class="{ stale: sigOf(scope.role)?.status === 'stale' }">
+              <div class="review-head">
+                <strong>{{ scope.signer }}</strong>
+                <q-badge :color="badgeColor(sigOf(scope.role)?.status ?? 'pending')">{{ badgeLabel(sigOf(scope.role)?.status ?? 'pending') }}</q-badge>
+              </div>
+              <span>{{ scope.team }}</span>
+              <p>{{ scope.scope }}</p>
+              <div class="fingerprint">
+                <template v-if="sigOf(scope.role)?.status === 'stale'">
+                  <span class="fp-line">原指纹 <code>{{ sigOf(scope.role)?.fingerprint }}</code></span>
+                  <q-icon name="arrow_forward" size="xs" />
+                  <span class="fp-line">现指纹 <code>{{ fpOf(scope.role) }}</code></span>
+                </template>
+                <template v-else>
+                  <span class="fp-line">复核指纹 <code>{{ fpOf(scope.role) }}</code></span>
+                </template>
+              </div>
+              <div v-if="sigOf(scope.role)?.status === 'signed'" class="signed-meta">
+                <q-icon name="verified" size="xs" />
+                <span>{{ sigOf(scope.role)?.signer }} · {{ formatTime(sigOf(scope.role)?.signedAt ?? null) }}</span>
+                <div class="opinion">「{{ sigOf(scope.role)?.opinion || '同意按方案施工' }}」</div>
+              </div>
+              <div v-if="signingRole === scope.role" class="sign-form">
+                <q-input v-model="opinionText" dense outlined label="签署意见（可留空）" />
+                <div class="sign-form-actions">
+                  <q-btn size="sm" color="primary" label="确认签署" @click="confirmSign(scope.role)" />
+                  <q-btn size="sm" flat label="取消" @click="signingRole = null" />
+                </div>
+              </div>
+              <q-btn v-else-if="sigOf(scope.role)?.status === 'pending'" outline no-caps label="接受方案" @click="startSign(scope.role)" />
+              <q-btn v-else outline no-caps color="warning" label="重新签署" @click="startSign(scope.role)" />
             </article>
           </div>
+
+          <div class="version-panel">
+            <div class="version-head">
+              <h3>版本记录</h3>
+              <span>锁定后生成不可变快照，旧版本继续可查；变更步骤或评论后需按新批次重新签署。</span>
+            </div>
+            <div v-if="store.versions.length === 0" class="empty-state">尚未发布版本。</div>
+            <div v-for="version in store.versions" :key="version.id" class="version-row">
+              <div class="version-info">
+                <strong>V{{ version.revision }}</strong>
+                <q-badge color="teal">{{ version.status }}</q-badge>
+                <span class="version-batch">{{ version.batchId }}</span>
+                <span>{{ formatTime(version.lockedAt) }}</span>
+                <span>{{ version.signatures.filter((s) => s.status === 'signed').length }}/4 签署</span>
+              </div>
+              <q-btn size="sm" outline no-caps label="查看快照" @click="openVersion(version)" />
+            </div>
+          </div>
+
           <div class="release-gate">
             <div>
               <q-icon name="verified_user" size="30px" />
-              <div><strong>发布前门禁</strong><span>要求冲突清零、意见全部关闭、四个角色完成签署。</span></div>
+              <div>
+                <strong>发布前门禁</strong>
+                <span>要求冲突清零、意见全部关闭、四个角色完成签署（{{ store.signedCount }}/4）。</span>
+              </div>
             </div>
-            <q-btn color="primary" no-caps icon="lock" label="锁定并发布 V{{ store.revision + 1 }}" :disable="store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn color="primary" no-caps icon="lock" label="锁定并发布 V{{ store.revision + 1 }}" :disable="store.conflicts.length > 0 || store.openComments.length > 0 || !store.allSigned" @click="store.lockPlan" />
           </div>
+
+          <q-dialog v-model="versionDialog">
+            <q-card v-if="viewingVersion" class="version-dialog">
+              <q-card-section class="version-dialog-head">
+                <div>
+                  <div class="eyebrow">VERSION SNAPSHOT</div>
+                  <h3>V{{ viewingVersion.revision }} · {{ viewingVersion.batchId }}</h3>
+                  <span>锁定于 {{ formatTime(viewingVersion.lockedAt) }}</span>
+                </div>
+                <q-btn flat round icon="close" @click="versionDialog = false" />
+              </q-card-section>
+              <q-card-section>
+                <div class="snapshot-section-title">步骤（{{ viewingVersion.steps.length }}）</div>
+                <div v-for="step in viewingVersion.steps" :key="step.id" class="snapshot-step">
+                  <strong>{{ step.id }}</strong>
+                  <span>{{ step.title }}</span>
+                  <small>{{ step.loadRate }}% · {{ step.clearance }}m · {{ step.wind }}m/s · {{ step.status }}</small>
+                </div>
+                <div class="snapshot-section-title">评论（{{ viewingVersion.comments.length }}）</div>
+                <div v-for="comment in viewingVersion.comments" :key="comment.id" class="snapshot-comment">
+                  <strong>{{ comment.author }} · {{ comment.role }}</strong>
+                  <span>{{ comment.content }}</span>
+                  <small>{{ comment.status === 'open' ? '未关闭' : '已解决' }}</small>
+                </div>
+                <div class="snapshot-section-title">角色签署（{{ viewingVersion.signatures.filter((s) => s.status === 'signed').length }}/4）</div>
+                <div v-for="sig in viewingVersion.signatures" :key="sig.role" class="snapshot-sign">
+                  <q-icon name="verified" size="xs" color="teal" />
+                  <strong>{{ sig.role }} · {{ sig.signer }}</strong>
+                  <code>{{ sig.fingerprint }}</code>
+                  <small>{{ formatTime(sig.signedAt) }}</small>
+                </div>
+              </q-card-section>
+            </q-card>
+          </q-dialog>
         </section>
       </q-page>
     </q-page-container>
