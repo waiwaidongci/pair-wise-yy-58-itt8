@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import * as THREE from 'three';
 import { useLiftStore } from './store';
+import { REVIEW_ROLES, type RoleId } from './authBatch';
 
 const route = useRoute();
 const router = useRouter();
@@ -17,6 +18,48 @@ let theta = 0.8;
 let phi = 0.9;
 let dragging = false;
 let previousX = 0;
+
+const reviewRoles = REVIEW_ROLES;
+
+type SignStatus = 'unsigned' | 'valid' | 'invalid';
+
+const statusMeta: Record<SignStatus, { label: string; color: string }> = {
+  valid: { label: '签署有效', color: 'positive' },
+  invalid: { label: '指纹失配·待重签', color: 'negative' },
+  unsigned: { label: '待签署', color: 'grey' }
+};
+
+const logKindLabel: Record<string, string> = {
+  batch: '批次',
+  invalidate: '失效',
+  sign: '签署',
+  conflict: '并发',
+  restore: '恢复',
+  lock: '锁定',
+  migrate: '迁移'
+};
+
+function roleView(roleId: RoleId) {
+  return store.signatureView(roleId);
+}
+
+function shortFp(fingerprint: string) {
+  return fingerprint ? fingerprint.slice(0, 8) : '—';
+}
+
+function shortTime(iso: string) {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+async function signRole(roleId: RoleId, terminal: string) {
+  await store.submitSignature(roleId, terminal);
+}
+
+async function raceRole(roleId: RoleId) {
+  await store.simulateConcurrentSubmit(roleId);
+}
 
 const nav = [
   { path: '/', label: '三维复核', icon: 'view_in_ar' },
@@ -219,7 +262,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="heading-actions">
             <q-btn outline no-caps icon="ios_share" label="导出吊装指令" />
-            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0 || store.validSignatureCount < reviewRoles.length" @click="store.lockPlan" />
           </div>
         </header>
 
@@ -338,31 +381,163 @@ onBeforeUnmount(() => {
         <section v-if="route.path === '/review'" class="content-panel full-panel">
           <div class="panel-heading">
             <div>
-              <span class="panel-kicker">MULTI-PARTY SIGN-OFF</span>
+              <span class="panel-kicker">MULTI-PARTY SIGN-OFF · 授权批次</span>
               <h2>多角色会签与发布门禁</h2>
             </div>
-            <div class="readiness"><strong>{{ store.readiness }}%</strong><span>发布就绪度</span></div>
+            <div class="readiness"><strong>{{ store.validSignatureCount }}/4</strong><span>有效签署 · 就绪度 {{ store.readiness }}%</span></div>
           </div>
+
+          <div class="batch-banner" :class="{ open: store.authBatch?.status === 'open', locked: store.authBatch?.status === 'locked' }">
+            <q-icon :name="store.authBatch?.status === 'locked' ? 'verified' : 'fingerprint'" size="26px" />
+            <div class="batch-meta">
+              <strong>{{ store.authBatch?.batchNo ?? '尚无授权批次' }}</strong>
+              <span v-if="store.authBatch">
+                方案 V{{ store.authBatch.planRevision }} · {{ store.authBatch.status === 'locked' ? '批次已锁定归档' : '批次在办' }}
+                · 发起于 {{ store.authBatch.openedAt }} · 服务端顺序号 #{{ store.serverSequence }}
+              </span>
+              <span v-else>发起后将按四位角色的复核范围冻结步骤与评论指纹。</span>
+            </div>
+            <q-space />
+            <q-btn
+              outline
+              no-caps
+              color="primary"
+              icon="add_moderator"
+              :label="store.authBatch?.status === 'locked' ? `发起 V${store.revision} 新批次` : '重新发起批次'"
+              :loading="store.submittingRole !== null"
+              @click="store.openAuthBatch"
+            />
+          </div>
+
+          <q-banner v-if="store.invalidRoles.length" class="invalidate-banner" dense rounded alert>
+            <template #avatar><q-icon name="gpp_bad" color="negative" /></template>
+            现场步骤或评论已修改：{{ store.invalidRoles.map((id) => reviewRoles.find((r) => r.id === id)?.name).join('、') }}
+            的冻结指纹失配，相关签署已作废需重算；范围外角色签署仍然有效。
+          </q-banner>
+
+          <q-banner v-if="store.retainedDraft" class="draft-banner" dense rounded alert>
+            <template #avatar><q-icon name="save_as" color="primary" /></template>
+            晚到终端（{{ store.retainedDraft.terminal }}）的现场内容已保留：
+            {{ reviewRoles.find((r) => r.id === store.retainedDraft?.roleId)?.name }}
+            复核范围 {{ store.retainedDraft.contentDigest }}（指纹 {{ shortFp(store.retainedDraft.fingerprint) }}，{{ store.retainedDraft.savedAt }}）。
+            <template #action>
+              <q-btn flat no-caps label="知道了" @click="store.dismissRetainedDraft" />
+            </template>
+          </q-banner>
+
           <div class="review-grid">
-            <article v-for="person in [
-              { name: '陈晓', team: '总包项目部', scope: '吊装工序与场地移交', state: '已接受' },
-              { name: '刘明', team: '设备管理', scope: '吊车参数与支腿地基', state: '待确认' },
-              { name: '周工', team: '安全监督', scope: '净空、风速与警戒区', state: '有保留' },
-              { name: '赵磊', team: '方案工程', scope: '载荷计算与路径参数', state: '待确认' }
-            ]" :key="person.name" class="review-card">
-              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === '已接受' ? 'positive' : person.state === '有保留' ? 'warning' : 'grey'">{{ person.state }}</q-badge></div>
-              <span>{{ person.team }}</span>
+            <article v-for="person in reviewRoles" :key="person.id" class="review-card" :class="roleView(person.id).status">
+              <div class="review-head">
+                <strong>{{ person.name }}</strong>
+                <q-badge :color="statusMeta[roleView(person.id).status].color">{{ statusMeta[roleView(person.id).status].label }}</q-badge>
+              </div>
+              <span>{{ person.team }} · 复核 {{ person.stepIds.join('、') }}</span>
               <p>{{ person.scope }}</p>
-              <q-btn v-if="person.state !== '已接受'" outline no-caps label="接受方案" />
-              <q-btn v-else disable no-caps label="已签署" />
+              <dl class="fp-line">
+                <div><dt>冻结指纹</dt><dd :class="{ mismatch: roleView(person.id).status === 'invalid' }">{{ shortFp(roleView(person.id).frozenFingerprint) }}</dd></div>
+                <div><dt>现场指纹</dt><dd>{{ shortFp(roleView(person.id).liveFingerprint) }}</dd></div>
+                <div v-if="roleView(person.id).signature"><dt>签署</dt><dd>{{ roleView(person.id).signature?.terminal }} · {{ shortTime(roleView(person.id).signature?.signedAt ?? '') }}</dd></div>
+              </dl>
+              <div class="review-actions">
+                <q-btn
+                  :color="roleView(person.id).status === 'valid' ? 'positive' : 'primary'"
+                  no-caps
+                  unelevated
+                  :icon="roleView(person.id).status === 'valid' ? 'check_circle' : 'draw'"
+                  :label="roleView(person.id).status === 'valid' ? '已签署' : roleView(person.id).status === 'invalid' ? '按新指纹重签' : '接受并签署'"
+                  :disable="!store.authBatch || store.authBatch.status === 'locked' || roleView(person.id).status === 'valid'"
+                  :loading="store.submittingRole === person.id"
+                  @click="signRole(person.id, '终端A')"
+                />
+                <q-btn
+                  outline
+                  no-caps
+                  icon="devices"
+                  label="双终端同时签"
+                  :disable="!store.authBatch || store.authBatch.status === 'locked' || store.submittingRole !== null"
+                  @click="raceRole(person.id)"
+                />
+              </div>
             </article>
           </div>
+
+          <div class="review-toolbar">
+            <q-btn
+              outline
+              no-caps
+              color="negative"
+              icon="storage"
+              :label="store.demoDiskFailure ? '下一次签署将模拟写入失败（已挂起）' : '演练：下一次签署写入失败'"
+              :disable="store.demoDiskFailure"
+              @click="store.armDiskFailure"
+            />
+            <span class="toolbar-hint">写入失败时事务回滚，本地按批次号恢复，不会留下半份签署。</span>
+          </div>
+
+          <div class="review-bottom">
+            <section class="auth-log-panel">
+              <h3>授权批次日志</h3>
+              <ul>
+                <li v-for="entry in store.authLogs" :key="entry.id">
+                  <q-badge :color="entry.kind === 'invalidate' || entry.kind === 'conflict' ? 'negative' : entry.kind === 'restore' ? 'warning' : 'primary'" class="log-kind">
+                    {{ logKindLabel[entry.kind] ?? entry.kind }}
+                  </q-badge>
+                  <div><p>{{ entry.message }}</p><small>{{ entry.at }}</small></div>
+                </li>
+                <li v-if="store.authLogs.length === 0" class="empty-state">暂无批次事件。</li>
+              </ul>
+            </section>
+
+            <section class="version-panel">
+              <h3>版本归档 · 旧版本可查</h3>
+              <q-expansion-item
+                v-for="version in store.versions"
+                :key="version.revision + '-' + version.batchNo + '-' + version.source"
+                :icon="version.source === 'locked' ? 'lock' : 'history'"
+                active-class="text-primary"
+              >
+                <template #header>
+                    <div class="version-line">
+                      <strong>V{{ version.revision }}</strong>
+                      <q-badge :color="version.source === 'locked' ? 'positive' : 'grey'" dense>
+                        {{ version.source === 'locked' ? '锁定发布' : '旧稿迁移' }}
+                      </q-badge>
+                      <span>{{ version.batchNo }}{{ version.lockedAt ? ' · ' + version.lockedAt : ' · 按当前步骤补指纹' }}</span>
+                    </div>
+                </template>
+                <div class="version-detail">
+                  <p v-for="sig in version.signatures" :key="sig.roleId + '-' + sig.signedAt">
+                    {{ sig.signer }}（{{ sig.terminal }}）· {{ shortFp(sig.frozenFingerprint) }} · {{ shortTime(sig.signedAt) }}
+                  </p>
+                  <p v-if="version.signatures.length === 0" class="empty-state">该批次尚无有效签署。</p>
+                  <details>
+                    <summary>查看 V{{ version.revision }} 步骤快照（{{ version.steps.length }} 步）</summary>
+                    <p v-for="step in version.steps" :key="step.id" class="snapshot-step">
+                      {{ step.id }} {{ step.title }} · {{ step.loadRate }}% · {{ step.clearance }}m · {{ step.wind }}m/s · {{ step.status }}
+                    </p>
+                  </details>
+                </div>
+              </q-expansion-item>
+              <div v-if="store.versions.length === 0" class="empty-state">暂无历史版本。</div>
+            </section>
+          </div>
+
           <div class="release-gate">
             <div>
               <q-icon name="verified_user" size="30px" />
-              <div><strong>发布前门禁</strong><span>要求冲突清零、意见全部关闭、四个角色完成签署。</span></div>
+              <div>
+                <strong>发布前门禁</strong>
+                <span>要求冲突清零、意见全部关闭、四个角色在当前批次的签署指纹全部有效（{{ store.validSignatureCount }}/4）。</span>
+              </div>
             </div>
-            <q-btn color="primary" no-caps icon="lock" label="锁定并发布 V{{ store.revision + 1 }}" :disable="store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn
+              color="primary"
+              no-caps
+              icon="lock"
+              :label="`锁定并发布 V${store.revision + 1}`"
+              :disable="store.conflicts.length > 0 || store.openComments.length > 0 || store.validSignatureCount < reviewRoles.length || !store.authBatch || store.authBatch.status === 'locked'"
+              @click="store.lockPlan"
+            />
           </div>
         </section>
       </q-page>

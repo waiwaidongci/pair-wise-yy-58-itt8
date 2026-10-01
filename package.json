@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 62058",
     "build": "vue-tsc --noEmit && vite build",
+    "verify": "esbuild scripts/verify-auth-batch.ts scripts/verify-store.ts --bundle --platform=node --format=esm --outdir=node_modules/.verify && node node_modules/.verify/verify-auth-batch.js && node node_modules/.verify/verify-store.js",
     "preview": "vite preview --host 0.0.0.0 --port 62058"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@types/three": "^0.178.0",
     "@vitejs/plugin-vue": "^6.0.0",
+    "esbuild": "^0.25.0",
     "sass-embedded": "^1.105.0",
     "typescript": "^5.8.3",
     "vite": "^7.0.0",
